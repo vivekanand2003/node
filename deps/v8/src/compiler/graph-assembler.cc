@@ -472,6 +472,27 @@ TNode<Boolean> JSGraphAssembler::ObjectIsUndetectable(TNode<Object> value) {
       graph()->NewNode(simplified()->ObjectIsUndetectable(), value));
 }
 
+Node* JSGraphAssembler::BooleanNot(Node* cond) {
+  return AddNode(graph()->NewNode(simplified()->BooleanNot(), cond));
+}
+
+Node* JSGraphAssembler::CheckSmi(Node* value, const FeedbackSource& feedback) {
+  return AddNode(graph()->NewNode(simplified()->CheckSmi(feedback), value,
+                                  effect(), control()));
+}
+
+Node* JSGraphAssembler::CheckNumberFitsInt32(Node* value,
+                                             const FeedbackSource& feedback) {
+  return AddNode(graph()->NewNode(simplified()->CheckNumberFitsInt32(feedback),
+                                  value, effect(), control()));
+}
+
+Node* JSGraphAssembler::CheckNumber(Node* value,
+                                    const FeedbackSource& feedback) {
+  return AddNode(graph()->NewNode(simplified()->CheckNumber(feedback), value,
+                                  effect(), control()));
+}
+
 Node* JSGraphAssembler::CheckIf(Node* cond, DeoptimizeReason reason,
                                 const FeedbackSource& feedback) {
   return AddNode(graph()->NewNode(simplified()->CheckIf(reason, feedback), cond,
@@ -594,8 +615,16 @@ class ArrayBufferViewAccessBuilder {
     // Case 1: Normal (backed by AB/SAB) or non-length tracking backed by GSAB
     // (can't go oob once constructed)
     auto GsabFixedOrNormal = [&]() {
-      return MachineLoadField<UintPtrT>(AccessBuilder::ForJSTypedArrayLength(),
-                                        view, UseInfo::Word());
+      TNode<UintPtrT> byte_length = MachineLoadField<UintPtrT>(
+          AccessBuilder::ForJSArrayBufferViewByteLength(), view,
+          UseInfo::Word());
+
+      TNode<Map> typed_array_map = a.LoadField<Map>(
+          AccessBuilder::ForMap(WriteBarrierKind::kNoWriteBarrier), view);
+      TNode<Uint32T> elements_kind = a.LoadElementsKind(typed_array_map);
+      TNode<Uint32T> element_size =
+          a.LookupByteSizeForElementsKind(elements_kind);
+      return a.UintPtrDiv(byte_length, a.ChangeUint32ToUintPtr(element_size));
     };
 
     // If we statically know we cannot have rab/gsab backed, we can simply

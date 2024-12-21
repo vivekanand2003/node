@@ -113,7 +113,7 @@ class JSArrayBuffer
   // non-detachable check.
   V8_EXPORT_PRIVATE V8_WARN_UNUSED_RESULT static Maybe<bool> Detach(
       DirectHandle<JSArrayBuffer> buffer, bool force_for_wasm_memory = false,
-      Handle<Object> key = Handle<Object>());
+      DirectHandle<Object> key = {});
 
   // Get a reference to backing store of this array buffer, if there is a
   // backing store. Returns nullptr if there is no backing store (e.g. detached
@@ -192,8 +192,24 @@ class ArrayBufferExtension final
 #else
     : public Malloced {
 #endif  // V8_COMPRESS_POINTERS
+  static constexpr uint64_t kAgeMask = 1;
+  static constexpr uint64_t kAccountingLengthBitOffset = 1;
+
  public:
-  enum class Age : uint8_t { kYoung, kOld };
+  enum class Age : uint8_t { kYoung = 0, kOld = 1 };
+
+  // Packs `accounting_length` and `age` into a single integer for consistent
+  // accounting, allowing resize while concurrently sweeping.
+  struct AccountingState {
+    size_t accounting_length() const {
+      DCHECK_LE(value >> kAccountingLengthBitOffset,
+                std::numeric_limits<size_t>::max());
+      return static_cast<size_t>(value >> kAccountingLengthBitOffset);
+    }
+    Age age() const { return static_cast<Age>(value & kAgeMask); }
+
+    uint64_t value;
+  };
 
   ArrayBufferExtension() : backing_store_(std::shared_ptr<BackingStore>()) {}
   explicit ArrayBufferExtension(std::shared_ptr<BackingStore> backing_store)
@@ -214,15 +230,27 @@ class ArrayBufferExtension final
   BackingStore* backing_store_raw() { return backing_store_.get(); }
 
   size_t accounting_length() const {
-    return accounting_length_.load(std::memory_order_relaxed);
+    return AccountingState{accounting_state_.load(std::memory_order_relaxed)}
+        .accounting_length();
+  }
+  void set_accounting_state(size_t accounting_length, Age age) {
+    accounting_state_.store((static_cast<uint64_t>(accounting_length)
+                             << kAccountingLengthBitOffset) |
+                                static_cast<uint8_t>(age),
+                            std::memory_order_relaxed);
   }
 
-  void set_accounting_length(size_t accounting_length) {
-    accounting_length_.store(accounting_length, std::memory_order_relaxed);
+  // Applies `delta` to `accounting_length` and returns the AccountingState
+  // before the update.
+  AccountingState UpdateAccountingLength(int64_t delta) {
+    return {accounting_state_.fetch_add(delta << kAccountingLengthBitOffset,
+                                        std::memory_order_relaxed)};
   }
 
-  size_t ClearAccountingLength() {
-    return accounting_length_.exchange(0, std::memory_order_relaxed);
+  // Clears `accounting_length` and returns the AccountingState before the
+  // update.
+  AccountingState ClearAccountingLength() {
+    return {accounting_state_.fetch_and(kAgeMask, std::memory_order_relaxed)};
   }
 
   std::shared_ptr<BackingStore> RemoveBackingStore() {
@@ -238,18 +266,26 @@ class ArrayBufferExtension final
   ArrayBufferExtension* next() const { return next_; }
   void set_next(ArrayBufferExtension* extension) { next_ = extension; }
 
-  Age age() const { return age_; }
-  void set_age(Age age) { age_ = age; }
+  Age age() const {
+    return AccountingState{accounting_state_.load(std::memory_order_relaxed)}
+        .age();
+  }
+  // Updates `age` and returns the AccountingState before the update.
+  AccountingState SetOld() {
+    return {accounting_state_.fetch_or(kAgeMask, std::memory_order_relaxed)};
+  }
+  AccountingState SetYoung() {
+    return {accounting_state_.fetch_and(~kAgeMask, std::memory_order_relaxed)};
+  }
 
  private:
   enum class GcState : uint8_t { Dead = 0, Copied, Promoted };
 
-  Age age_ = Age::kOld;
   std::atomic<bool> marked_{false};
   std::atomic<GcState> young_gc_state_{GcState::Dead};
   std::shared_ptr<BackingStore> backing_store_;
   ArrayBufferExtension* next_ = nullptr;
-  std::atomic<size_t> accounting_length_{0};
+  std::atomic<uint64_t> accounting_state_{kAgeMask};
 
   GcState young_gc_state() const {
     return young_gc_state_.load(std::memory_order_relaxed);
@@ -295,15 +331,12 @@ class JSTypedArray
   static constexpr size_t kMaxByteLength = JSArrayBuffer::kMaxByteLength;
   static_assert(kMaxByteLength == v8::TypedArray::kMaxByteLength);
 
-  // [length]: length of typed array in elements.
-  DECL_PRIMITIVE_GETTER(length, size_t)
-
   DECL_GETTER(base_pointer, Tagged<Object>)
   DECL_ACQUIRE_GETTER(base_pointer, Tagged<Object>)
 
   // ES6 9.4.5.3
   V8_WARN_UNUSED_RESULT static Maybe<bool> DefineOwnProperty(
-      Isolate* isolate, Handle<JSTypedArray> o, Handle<Object> key,
+      Isolate* isolate, DirectHandle<JSTypedArray> o, DirectHandle<Object> key,
       PropertyDescriptor* desc, Maybe<ShouldThrow> should_throw);
 
   ExternalArrayType type();
@@ -325,6 +358,7 @@ class JSTypedArray
   inline bool is_on_heap(AcquireLoadTag tag) const;
 
   // Only valid to call when IsVariableLength() is true.
+  size_t GetVariableByteLengthOrOutOfBounds(bool& out_of_bounds) const;
   size_t GetVariableLengthOrOutOfBounds(bool& out_of_bounds) const;
 
   inline size_t GetLengthOrOutOfBounds(bool& out_of_bounds) const;
@@ -401,11 +435,6 @@ class JSTypedArray
   template <typename IsolateT>
   friend class Deserializer;
   friend class Factory;
-
-  DECL_PRIMITIVE_SETTER(length, size_t)
-  // Reads the "length" field, doesn't assert the TypedArray is not RAB / GSAB
-  // backed.
-  inline size_t LengthUnchecked() const;
 
   DECL_GETTER(external_pointer, Address)
 
